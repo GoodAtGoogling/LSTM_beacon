@@ -4,6 +4,7 @@ tensorflow
 keras
 flask
 joblib
-sklearn
+scikit-learn
 gevent
 requests
+matplotlib

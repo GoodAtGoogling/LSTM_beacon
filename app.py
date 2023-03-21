@@ -1,99 +1,82 @@
+from flask import Flask, request, render_template
+from tensorflow.keras.models import load_model
+from sklearn.preprocessing import MinMaxScaler
 import pandas as pd
 import numpy as np
-import flask
-from keras.models import load_model
 import joblib
-import csv
-import codecs
 
-from warnings import simplefilter
-# ignore all future warnings
-simplefilter(action='ignore', category=FutureWarning)
+app = Flask(__name__)
 
-# initialize the Flask application
-app = flask.Flask(__name__)
+# Load the model and scaler
+model = load_model("model.h5")
+scaler = joblib.load("scaler_data")
 
-# load the pre-trained Keras model
-def define_model():
-    global model
-    model = load_model('model.h5')
-    return print("Model Loaded")
-
-# define anomaly threshold
-limit = 0.14
-
-# this method processes any requests to the /submit endpoint
-@app.route("/submit", methods=["POST"])
-def submit():
-    # initialize the data dictionary that will be returned in the response
-    data_out = {}
-
-    # load the data file from our endpoint
-    if flask.request.method == "POST":
-
-        # read the data file
-        file = flask.request.files["data_file"]
-        if not file:
-            return "No file submitted"
-        data = []
-        stream = codecs.iterdecode(file.stream, 'utf-8')
-        for row in csv.reader(stream, dialect=csv.excel):
-            if row:
-                data.append(row)
-
-        # convert input data to pandas dataframe
-        df = pd.DataFrame(data)
-        df.set_index(df.iloc[:, 0], inplace=True)
-        df2 = df.drop(df.columns[0], axis=1)
-        df2 = df2.astype(np.float64)
-
-        # normalize the data
-        scaler = joblib.load("./scaler_data")
-        X = scaler.transform(df2)
-        # reshape data set for LSTM [samples, time steps, features]
-        X = X.reshape(X.shape[0], 1, X.shape[1])
-
-        # calculate the reconstruction loss on the input data
-
-        data_out["Analysis"] = []
-        preds = model.predict(X)
-        preds = preds.reshape(preds.shape[0], preds.shape[2])
-        preds = pd.DataFrame(preds, columns=df2.columns)
-        preds.index = df2.index
-
-        scored = pd.DataFrame(index=df2.index)
-        yhat = X.reshape(X.shape[0], X.shape[2])
-        scored['Loss_mae'] = np.mean(np.abs(yhat - preds), axis=1)
-        scored['Threshold'] = limit
-        scored['Anomaly'] = scored['Loss_mae'] > scored['Threshold']
-
-        # determine if an anomaly was detected
-        triggered = []
-        for i in range(len(scored)):
-            temp = scored.iloc[i]
-            if temp.iloc[2]:
-                triggered.append(temp)
-        print(len(triggered))
-        if len(triggered) > 0:
-            for j in range(len(triggered)):
-                out = triggered[j]
-                result = {"Anomaly": True, "value": out[0], "filename": out.name}
-                data_out["Analysis"].append(result)
-        else:
-            result = {"Anomaly": "No Anomalies Detected"}
-            data_out["Analysis"].append(result)
-
-    # return the data dictionary as a JSON response
-    return flask.jsonify(data_out)
+# Define the threshold for anomaly detection
+threshold = 0.05
 
 
-# first load the model and then start the server
-# we need to specify the host of 0.0.0.0 so that the app is available on both localhost as well
-# as on the external IP of the Docker container
-if __name__ == "__main__":
-    print(("Loading the AI model and starting the server..."
-          "Please wait until the server has fully started before submitting"
-          "******************************************************************"))
-    define_model()
-    #  app.run() # outside of a Docker container
-    app.run(host='0.0.0.0')  # within a Docker container
+def detect_anomaly(data):
+    # Scale the data
+    scaled_data = scaler.transform(data)
+
+    # Reshape the data for the LSTM model
+    reshaped_data = scaled_data.reshape(scaled_data.shape[0], 1, scaled_data.shape[1])
+
+    # Make predictions with the model
+    predictions = model.predict(reshaped_data)
+
+    # Reshape the predictions and the original data
+    predictions = predictions.reshape(predictions.shape[0], predictions.shape[2])
+    original_data = data.values.reshape(data.shape[0], data.shape[1])
+
+    # Calculate the mean absolute error between the predictions and the original data
+    mae = np.mean(np.abs(predictions - original_data), axis=1)
+
+    # Create a DataFrame with the results
+    results = pd.DataFrame({'time': data.index, 'Loss_mae': mae})
+    results.set_index('time', inplace=True)
+
+    # Set the anomaly label based on the threshold
+    results['Anomaly'] = results['Loss_mae'] > threshold
+
+    return results
+
+
+
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    if request.method == 'POST':
+        # Check if a file was uploaded
+        if 'file' not in request.files:
+            return render_template('index.html', message='No file selected')
+        file = request.files['file']
+
+        # Check if the file is empty
+        if file.filename == '':
+            return render_template('index.html', message='No file selected')
+
+        # Check if the file is valid
+        try:
+            data = pd.read_csv(file, index_col='time')
+        except Exception as e:
+            return render_template('index.html', message='Error reading file: {}'.format(str(e)))
+
+        # Detect anomalies in the data
+        results = detect_anomaly(data)
+
+        # Generate a plot of the data and anomalies
+        plot = results.plot(y='Loss_mae', logy=True, figsize=(16, 9), color=['blue', 'red'], legend=False).get_figure()
+
+        # Save the plot to a file
+        #plot.savefig('static/plot.png')
+        #plot.clf()
+
+        # Render the results
+        return render_template('results.html', data=results.to_html(), plot='plot.png')
+
+    # Render the home page
+    return render_template('index.html')
+
+
+if __name__ == '__main__':
+    app.run(host="0.0.0.0")
